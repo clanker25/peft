@@ -1,0 +1,16 @@
+{
+  "auto_mapping": null,
+  "base_model_name_or_path": null,
+  "encoder_hidden_size": 3072,
+  "inference_mode": false,
+  "num_attention_heads": 25,
+  "num_layers": 27,
+  "num_transformer_submodules": 2,
+  "num_virtual_tokens": 100,
+  "init_weights": "zero",
+  "peft_type": "PREFIX_TUNING",
+  "prefix_projection": true,
+  "revision": null,
+  "task_type": "CAUSAL_LM",
+  "token_dim": 3072
+}

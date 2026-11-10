@@ -1,0 +1,6 @@
+{
+  "optimizer_kwargs": {
+    "lr": 6e-4
+  }
+}
+
